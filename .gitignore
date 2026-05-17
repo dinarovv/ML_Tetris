@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+ENV/
+
+# Среды разработки
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Артефакты обучения (опционально — можно убрать, если хочешь коммитить модели)
+# *.pt
+# *.json
+# *.png
+# logs/
+
+# Системное
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
