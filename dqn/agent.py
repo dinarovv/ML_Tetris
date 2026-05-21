@@ -1,18 +1,24 @@
 """
 Ветка 2: Deep Q-Network (DQN).
 
-ВЕРСИЯ ПОСЛЕ ПАКЕТОВ 1, 2 И 3:
-  Пакет 1 (научная корректность):
-    - Target = r + γ·max_a' Q_target(s', a') по всем next-ходам
-    - Выбор для среды и расчёт target полностью разделены
+ВЕРСИЯ ПОСЛЕ ПАКЕТА 4.1 — исправлена формула target.
 
-  Пакет 3 (стабильность обучения):
-    - Huber loss (SmoothL1Loss) вместо MSE — устойчивее к выбросам
-    - Gradient clipping (max_norm=1.0) — защита от взрыва градиентов
+ИСТОРИЯ ИЗМЕНЕНИЙ:
+  Пакет 1: max по всем next-ходам, разделён exploration и target
+  Пакет 3: Huber loss + gradient clipping
+  Пакет 4.1: ПРАВИЛЬНАЯ формула target для afterstate-формулировки
 
-Идея:
-  Нейросеть принимает 4 признака состояния поля (после хода) и предсказывает
-  Q-значение — ожидаемую суммарную награду из этого состояния.
+  Раньше target = r_текущего_хода + γ · max Q(next_afterstates)
+  Стало  target = max_a (r_a + γ · Q_target(next_afterstate_a))
+
+  Где r_a — награда за следующий ход (а не за тот, который привёл в state_feat).
+  Это устраняет смещение Q-значений и согласует Bellman-уравнение
+  с afterstate-семантикой Q-функции.
+
+ИДЕЯ:
+  Q-сеть оценивает значение afterstate — состояния поля после хода агента.
+  Q(s_after) = ожидаемая будущая дисконтированная награда, начиная с s_after.
+  При выборе хода агент сравнивает Q-значения всех возможных afterstate.
 """
 
 import numpy as np
@@ -32,10 +38,29 @@ except ImportError:
     print("[!] PyTorch не найден. Установи: pip install torch")
 
 
+# ------------------------------------------------------------------ #
+#  Награда за ход — общая функция (не требует PyTorch)                #
+# ------------------------------------------------------------------ #
+
+BOARD_WIDTH = 10  # ширина поля Тетриса
+
+def _compute_reward(features):
+    """
+    Награда за ход: 1 (за выживание) + бонус за очищенные линии.
+    Соответствует формуле reward в TetrisGame.step().
+
+    Используется при:
+      1) построении next_options для записи в memory
+      2) выборе хода через _greedy_move (учёт непосредственной награды)
+    """
+    lc = features['lines_cleared']
+    return 1.0 + (lc ** 2) * BOARD_WIDTH
+
+
 if TORCH_AVAILABLE:
 
     class QNetwork(nn.Module):
-        """4 → 64 → 64 → 1. Выход — Q-значение состояния."""
+        """4 → 64 → 64 → 1. Выход — Q-значение afterstate."""
 
         def __init__(self, input_dim=4, hidden=64):
             super().__init__()
@@ -52,16 +77,21 @@ if TORCH_AVAILABLE:
 
     class ReplayMemory:
         """
-        Каждый элемент: (state_feat, reward, next_feats_list, done)
-        next_feats_list — список признаков всех возможных next-ходов
-        (нужно для корректного max в target).
+        Каждый элемент: (state_feat, next_options)
+          state_feat   — признаки afterstate (после хода агента)
+          next_options — список (reward_a, next_feat_a) для всех возможных
+                         следующих ходов из этого afterstate. Пустой список
+                         означает terminal состояние (Q должно быть 0).
+
+        Важно: reward_a — это награда за СЛЕДУЮЩИЙ ход, а не за тот,
+        который привёл в state_feat. Это ключевое отличие от прошлых версий.
         """
 
         def __init__(self, capacity=30_000):
             self.buffer = deque(maxlen=capacity)
 
-        def push(self, state_feat, reward, next_feats_list, done):
-            self.buffer.append((state_feat, reward, next_feats_list, done))
+        def push(self, state_feat, next_options):
+            self.buffer.append((state_feat, next_options))
 
         def sample(self, batch_size):
             return random.sample(self.buffer, batch_size)
@@ -70,21 +100,7 @@ if TORCH_AVAILABLE:
             return len(self.buffer)
 
     class DQNAgent:
-        """
-        Агент DQN.
-
-        Параметры (по умолчанию — конфигурация для B3):
-          lr             — скорость обучения Adam
-          gamma          — дисконт-фактор
-          epsilon        — начальная вероятность исследования
-          epsilon_min    — минимальное значение epsilon
-          epsilon_decay  — множитель убывания за эпизод
-          memory_size    — объём Replay Memory
-          batch_size     — размер мини-батча обучения
-          target_update  — частота синхронизации target network (в шагах)
-          use_huber      — Huber loss вместо MSE (по умолчанию True)
-          grad_clip      — max-norm для gradient clipping (None = выключено)
-        """
+        """DQN-агент с корректной Bellman-формулой для afterstate Q."""
 
         def __init__(self,
                      lr=0.001,
@@ -114,7 +130,6 @@ if TORCH_AVAILABLE:
             self._sync_target()
 
             self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-            # Huber устойчивее к выбросам в target, что важно для DQN
             self.loss_fn = nn.SmoothL1Loss() if use_huber else nn.MSELoss()
 
         def _sync_target(self):
@@ -134,18 +149,30 @@ if TORCH_AVAILABLE:
         # -------- Выбор хода -------- #
 
         def _greedy_move(self, moves):
-            """Greedy выбор без epsilon (через policy_net)."""
+            """
+            Чисто-greedy выбор: ход с максимальным (reward + γ * Q_policy(afterstate)).
+
+            Раньше выбор был просто argmax Q(afterstate), что фактически
+            эквивалентно argmax при одинаковом γ для всех. Теперь явно учитываем
+            непосредственную награду каждого возможного хода.
+            """
             if not moves:
                 return None
+
             self.policy_net.eval()
             with torch.no_grad():
                 feats_t = self._feats_to_batch([m['features'] for m in moves])
                 qs = self.policy_net(feats_t).squeeze(-1)
-                best_idx = int(qs.argmax().item())
+                # Учитываем непосредственный reward каждого хода
+                rewards = torch.FloatTensor([
+                    _compute_reward(m['features']) for m in moves
+                ])
+                scores = rewards + self.gamma * qs
+                best_idx = int(scores.argmax().item())
             return moves[best_idx]
 
         def choose_move(self, moves):
-            """Epsilon-greedy для взаимодействия со средой."""
+            """Epsilon-greedy для среды."""
             if not moves:
                 return None
             if random.random() < self.epsilon:
@@ -154,41 +181,51 @@ if TORCH_AVAILABLE:
 
         # -------- Память и обучение -------- #
 
-        def remember(self, state_feat, reward, next_feats_list, done):
-            self.memory.push(state_feat, reward, next_feats_list, done)
+        def remember(self, state_feat, next_options):
+            self.memory.push(state_feat, next_options)
 
         def train_step(self):
             """
-            Один шаг обучения. Target = r + γ·max_a' Q_target(s', a').
+            Один шаг обучения. Целевая функция:
+                target = 0,                                 если state_feat терминальный
+                target = max_a (r_a + γ · Q_target(s_a)),   иначе
+
+            где (r_a, s_a) — пары (награда, afterstate-feat) для всех
+            возможных next-ходов из state_feat.
             """
             if len(self.memory) < self.batch_size:
                 return None
 
             batch = self.memory.sample(self.batch_size)
 
-            states_t = self._feats_to_batch([s for s, _, _, _ in batch])
-            rewards_t = torch.FloatTensor([r for _, r, _, _ in batch])
-            dones_t = torch.FloatTensor([d for _, _, _, d in batch])
+            states_t = self._feats_to_batch([s for s, _ in batch])
 
             self.policy_net.train()
             current_q = self.policy_net(states_t).squeeze(-1)
 
-            target_q_max = torch.zeros(len(batch))
+            target_values = torch.zeros(len(batch))
             with torch.no_grad():
-                for i, (_, _, next_feats_list, done) in enumerate(batch):
-                    if done or not next_feats_list:
-                        target_q_max[i] = 0.0
+                for i, (_, next_options) in enumerate(batch):
+                    if not next_options:
+                        # Terminal afterstate: Q = 0
+                        target_values[i] = 0.0
                     else:
-                        next_t = self._feats_to_batch(next_feats_list)
-                        target_q_max[i] = self.target_net(next_t).squeeze(-1).max()
+                        next_rewards = torch.FloatTensor(
+                            [r for r, _ in next_options]
+                        )
+                        next_feats_t = self._feats_to_batch(
+                            [f for _, f in next_options]
+                        )
+                        next_qs = self.target_net(next_feats_t).squeeze(-1)
+                        # max_a (r_a + γ · Q_target(s_a))
+                        target_values[i] = (
+                            next_rewards + self.gamma * next_qs
+                        ).max()
 
-            target_q = rewards_t + self.gamma * target_q_max * (1 - dones_t)
-
-            loss = self.loss_fn(current_q, target_q)
+            loss = self.loss_fn(current_q, target_values)
             self.optimizer.zero_grad()
             loss.backward()
 
-            # Защита от взрыва градиентов (рекомендация научрука)
             if self.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.policy_net.parameters(), max_norm=self.grad_clip

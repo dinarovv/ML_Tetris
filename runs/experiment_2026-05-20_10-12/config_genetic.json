@@ -1,0 +1,12 @@
+{
+    "_comment": "Конфигурация обучения генетического алгоритма. Параметры эксперимента A3.",
+    "_version": "A3",
+
+    "seed": 42,
+
+    "population_size": 50,
+    "generations": 10,
+    "games_per_agent": 5,
+    "max_steps": 1500,
+    "elite_frac": 0.2
+}

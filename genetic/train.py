@@ -1,19 +1,16 @@
 """
 Запуск обучения — ветка Генетический алгоритм.
 
-ВЕРСИЯ ПОСЛЕ ПАКЕТОВ 1, 2, 3:
-  - Фиксация seed (Пакет 1)
-  - Multi-seed запуски + CSV логирование (Пакет 2)
+ВЕРСИЯ ПОСЛЕ ПАКЕТА 4 (полная):
+  4.4: единый конфиг через --config <path>
+  4.5: --output-dir для интеграции в run_experiments.py
 
 Использование:
-    python genetic/train.py                          # один запуск seed=42
-    python genetic/train.py --seeds 42,123,777       # три запуска подряд
-    python genetic/train.py --seeds 42 --generations 5  # короткий тест
-
-Артефакты:
-    genetic/logs/genetic_seed{N}.csv      — лог по поколениям
-    genetic/best_weights_seed{N}.json     — веса лучшего агента для каждого seed
-    genetic/training_plot_seed{N}.png     — график для каждого seed
+    python genetic/train.py
+    python genetic/train.py --seeds 42,123,777
+    python genetic/train.py --config configs/genetic.json
+    python genetic/train.py --config configs/genetic.json --seeds 42 \\
+        --output-dir runs/exp1/genetic_seed42
 """
 
 import sys
@@ -30,18 +27,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from genetic.agent import GeneticAlgorithm
 
 # ------------------------------------------------------------------ #
-#  Параметры обучения по умолчанию (соответствуют конфигурации A3)    #
+#  Дефолты                                                             #
 # ------------------------------------------------------------------ #
 
-DEFAULT_SEED = 42
-
-POPULATION_SIZE = 50
-GENERATIONS = 10
-GAMES_PER_AGENT = 5
-MAX_STEPS = 1500
+DEFAULTS = {
+    'seed': 42,
+    'population_size': 50,
+    'generations': 10,
+    'games_per_agent': 5,
+    'max_steps': 1500,
+    'elite_frac': 0.2,
+}
 
 GA_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGS_DIR = os.path.join(GA_DIR, 'logs')
+
+
+def load_config(path):
+    if not path:
+        return {}
+    with open(path, encoding='utf-8') as f:
+        config = json.load(f)
+    return {k: v for k, v in config.items() if not k.startswith('_')}
+
+
+def merge_params(defaults, config):
+    result = dict(defaults)
+    result.update(config)
+    return result
 
 
 def set_seed(seed):
@@ -50,31 +62,8 @@ def set_seed(seed):
 
 
 def save_weights(agent, path):
-    data = {'weights': agent.weights.tolist()}
     with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"  Веса сохранены: {path}")
-
-
-def plot_training(history, path):
-    gens = [h['generation'] for h in history]
-    best = [h['best'] for h in history]
-    avg = [h['avg'] for h in history]
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(gens, best, label='Лучший счёт', color='#5B4FD6', linewidth=2)
-    ax.plot(gens, avg, label='Средний счёт', color='#1D9E75',
-            linewidth=1.5, linestyle='--')
-    ax.fill_between(gens, avg, best, alpha=0.1, color='#5B4FD6')
-    ax.set_xlabel('Поколение')
-    ax.set_ylabel('Счёт')
-    ax.set_title('Обучение генетического алгоритма — Тетрис')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    print(f"  График сохранён: {path}")
-    plt.close()
+        json.dump({'weights': agent.weights.tolist()}, f, indent=2)
 
 
 def write_history_csv(history, csv_path):
@@ -93,73 +82,126 @@ def write_history_csv(history, csv_path):
             ])
 
 
-def run_single(seed, population_size, generations, games_per_agent, max_steps):
-    """Один полный прогон с заданным seed."""
+def plot_training(history, path):
+    gens = [h['generation'] for h in history]
+    best = [h['best'] for h in history]
+    avg  = [h['avg']  for h in history]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(gens, best, label='Лучший счёт', color='#5B4FD6', linewidth=2)
+    ax.plot(gens, avg, label='Средний счёт', color='#1D9E75',
+            linewidth=1.5, linestyle='--')
+    ax.fill_between(gens, avg, best, alpha=0.1, color='#5B4FD6')
+    ax.set_xlabel('Поколение')
+    ax.set_ylabel('Счёт')
+    ax.set_title('Обучение генетического алгоритма — Тетрис')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+# ------------------------------------------------------------------ #
+#  Один прогон                                                         #
+# ------------------------------------------------------------------ #
+
+def run_single(seed, params, output_dir=None):
+    """Один прогон GA с заданным seed."""
     set_seed(seed)
+    output_dir = output_dir or GA_DIR
 
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    csv_path = os.path.join(LOGS_DIR, f'genetic_seed{seed}.csv')
-    weights_path = os.path.join(GA_DIR, f'best_weights_seed{seed}.json')
-    plot_path = os.path.join(GA_DIR, f'training_plot_seed{seed}.png')
+    logs_dir = os.path.join(output_dir, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
 
-    print("=" * 60)
-    print(f"GA | seed={seed} | pop={population_size} | gens={generations} | "
-          f"games={games_per_agent} | max_steps={max_steps}")
-    print("=" * 60)
+    csv_path     = os.path.join(logs_dir,   f'genetic_seed{seed}.csv')
+    weights_path = os.path.join(output_dir, f'best_weights_seed{seed}.json')
+    plot_path    = os.path.join(output_dir, f'training_plot_seed{seed}.png')
+
+    print("=" * 64)
+    print(f"GA | seed={seed} | pop={params['population_size']} | "
+          f"gens={params['generations']} | games={params['games_per_agent']} | "
+          f"max_steps={params['max_steps']}")
+    print(f"     output: {output_dir}")
+    print("=" * 64)
 
     ga = GeneticAlgorithm(
-        population_size=population_size,
-        games_per_agent=games_per_agent,
-        max_steps=max_steps,
+        population_size=params['population_size'],
+        games_per_agent=params['games_per_agent'],
+        max_steps=params['max_steps'],
     )
-    best_agent = ga.run(generations=generations)
+    best_agent = ga.run(generations=params['generations'])
 
     save_weights(best_agent, weights_path)
+    print(f"  Веса сохранены: {weights_path}")
+
     write_history_csv(ga.history, csv_path)
-    print(f"  Лог CSV: {csv_path}")
+    print(f"  CSV: {csv_path}")
+
     plot_training(ga.history, plot_path)
+    print(f"  График: {plot_path}")
 
     final = ga.history[-1]
+    global_best = max(h['best'] for h in ga.history)
+
     return {
+        'method': 'genetic',
         'seed': seed,
-        'best': float(ga.best_score),
-        'final_best': final['best'],
-        'final_avg': final['avg'],
+        'best_score': float(global_best),
+        'final_best': float(final['best']),
+        'final_avg':  float(final['avg']),
+        'best_weights': best_agent.weights.tolist(),
+        'artifacts': {
+            'csv':     csv_path,
+            'weights': weights_path,
+            'plot':    plot_path,
+        },
     }
 
 
+# ------------------------------------------------------------------ #
+#  CLI                                                                 #
+# ------------------------------------------------------------------ #
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seeds', type=str, default=str(DEFAULT_SEED),
-                        help='Один seed (42) или несколько через запятую (42,123,777)')
-    parser.add_argument('--population', type=int, default=POPULATION_SIZE)
-    parser.add_argument('--generations', type=int, default=GENERATIONS)
-    parser.add_argument('--games', type=int, default=GAMES_PER_AGENT)
-    parser.add_argument('--max-steps', type=int, default=MAX_STEPS)
+    parser = argparse.ArgumentParser(description='Обучение GA')
+    parser.add_argument('--config', type=str, default=None)
+    parser.add_argument('--seeds', type=str, default=None)
+    parser.add_argument('--generations', type=int, default=None)
+    parser.add_argument('--output-dir', type=str, default=None)
     args = parser.parse_args()
 
-    seeds = [int(s.strip()) for s in args.seeds.split(',')]
-    results = []
+    config = load_config(args.config)
+    params = merge_params(DEFAULTS, config)
 
+    if args.generations is not None:
+        params['generations'] = args.generations
+
+    if args.seeds is not None:
+        seeds = [int(s.strip()) for s in args.seeds.split(',')]
+    else:
+        seeds = [params.get('seed', DEFAULTS['seed'])]
+
+    if args.config:
+        print(f"  Конфиг: {args.config}")
+
+    results = []
     for seed in seeds:
-        result = run_single(
-            seed,
-            args.population, args.generations, args.games, args.max_steps,
-        )
+        result = run_single(seed, params, output_dir=args.output_dir)
         results.append(result)
         print()
 
-    # Сводка
     if len(results) > 1:
-        print("=" * 60)
+        print("=" * 64)
         print("СВОДКА ПО ВСЕМ ПРОГОНАМ")
-        print("=" * 60)
-        bests = [r['best'] for r in results]
-        print(f"  Лучшие счёта:   {bests}")
-        print(f"  Mean ± Std:     {np.mean(bests):.0f} ± {np.std(bests):.0f}")
-        print(f"  Медиана:        {np.median(bests):.0f}")
-        print()
-        print("  Для детальной агрегации запусти: python analyze.py")
+        print("=" * 64)
+        bests = [r['best_score'] for r in results]
+        print(f"  Seeds:           {[r['seed'] for r in results]}")
+        print(f"  Лучшие за прогон:{[int(v) for v in bests]}")
+        print(f"  Mean ± std:      {np.mean(bests):.0f} ± {np.std(bests):.0f}")
+        print(f"  Медиана:         {np.median(bests):.0f}")
+
+    return results
 
 
 if __name__ == '__main__':
